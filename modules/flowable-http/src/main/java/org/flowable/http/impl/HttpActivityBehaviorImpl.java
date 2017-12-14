@@ -1,14 +1,13 @@
-/* Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+/*
+ * Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file except
+ * in compliance with the License. You may obtain a copy of the License at
  *
- *      http://www.apache.org/licenses/LICENSE-2.0
+ * http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing, software distributed under the License
+ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+ * or implied. See the License for the specific language governing permissions and limitations under
+ * the License.
  */
 package org.flowable.http.impl;
 
@@ -25,6 +24,7 @@ import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLSession;
 
 import org.apache.commons.lang3.StringUtils;
+import org.apache.http.Consts;
 import org.apache.http.Header;
 import org.apache.http.HttpMessage;
 import org.apache.http.client.ClientProtocolException;
@@ -38,6 +38,7 @@ import org.apache.http.client.methods.HttpRequestBase;
 import org.apache.http.client.utils.URIBuilder;
 import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
 import org.apache.http.conn.ssl.TrustSelfSignedStrategy;
+import org.apache.http.entity.ContentType;
 import org.apache.http.entity.StringEntity;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.DefaultHttpRequestRetryHandler;
@@ -77,13 +78,13 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
 
     private static final long serialVersionUID = 1L;
     private static final Logger LOGGER = LoggerFactory.getLogger(HttpActivityBehaviorImpl.class);
-    
+
     protected HttpServiceTask httpServiceTask;
 
     protected final Timer timer = new Timer(true);
     protected final CloseableHttpClient client;
 
-    public HttpActivityBehaviorImpl() {  
+    public HttpActivityBehaviorImpl() {
         HttpClientConfig config = CommandContextUtil.getProcessEngineConfiguration().getHttpClientConfig();
         HttpClientBuilder httpClientBuilder = HttpClientBuilder.create();
 
@@ -92,14 +93,13 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
             try {
                 SSLContextBuilder builder = new SSLContextBuilder();
                 builder.loadTrustMaterial(null, new TrustSelfSignedStrategy());
-                httpClientBuilder.setSSLSocketFactory(
-                        new SSLConnectionSocketFactory(builder.build(), new HostnameVerifier() {
-                            @Override
-                            public boolean verify(String s, SSLSession sslSession) {
-                                return true;
-                            }
-                        }));
-                
+                httpClientBuilder.setSSLSocketFactory(new SSLConnectionSocketFactory(builder.build(), new HostnameVerifier() {
+                    @Override
+                    public boolean verify(String s, SSLSession sslSession) {
+                        return true;
+                    }
+                }));
+
             } catch (Exception e) {
                 LOGGER.error("Could not configure HTTP client SSL self signed strategy", e);
             }
@@ -132,14 +132,28 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
         });
     }
 
+    private ContentType determindContentType(final HttpRequest requestInfo) {
+        ContentType contentType = null;
+        try {
+            contentType = ContentType.parse(requestInfo.getHeaders());
+            if (null == contentType.getCharset()) {
+                contentType.withCharset(Consts.UTF_8);
+            }
+        } catch (Exception e) {
+            LOGGER.warn("Exception while parsing HTTP Headers for Content-Type, it might be fall back to text/plain;UTF-8", e);
+            contentType = ContentType.create("text/plain", Consts.UTF_8);
+        }
+        return contentType;
+    }
+
     @Override
     public HttpResponse perform(final DelegateExecution execution, final HttpRequest requestInfo) {
 
         HttpRequestBase request = null;
         CloseableHttpResponse response = null;
-        
+
         ProcessEngineConfigurationImpl processEngineConfiguration = CommandContextUtil.getProcessEngineConfiguration();
-        
+
         try {
             if (httpServiceTask.getHttpRequestHandler() != null) {
                 HttpRequestHandler httpRequestHandler = createHttpRequestHandler(httpServiceTask.getHttpRequestHandler(), processEngineConfiguration);
@@ -148,7 +162,7 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
         } catch (Exception e) {
             throw new FlowableException("Exception while invoking HttpRequestHandler: " + e.getMessage(), e);
         }
-        
+
         try {
             URIBuilder uri = new URIBuilder(requestInfo.getUrl());
             switch (requestInfo.getMethod()) {
@@ -158,13 +172,13 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
                 }
                 case "POST": {
                     HttpPost post = new HttpPost(uri.toString());
-                    post.setEntity(new StringEntity(requestInfo.getBody()));
+                    post.setEntity(new StringEntity(requestInfo.getBody(), determindContentType(requestInfo)));
                     request = post;
                     break;
                 }
                 case "PUT": {
                     HttpPut put = new HttpPut(uri.toString());
-                    put.setEntity(new StringEntity(requestInfo.getBody()));
+                    put.setEntity(new StringEntity(requestInfo.getBody(), determindContentType(requestInfo)));
                     request = put;
                     break;
                 }
@@ -205,10 +219,11 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
             if (response.getEntity() != null) {
                 responseInfo.setBody(EntityUtils.toString(response.getEntity()));
             }
-            
+
             try {
                 if (httpServiceTask.getHttpResponseHandler() != null) {
-                    HttpResponseHandler httpResponseHandler = createHttpResponseHandler(httpServiceTask.getHttpResponseHandler(), processEngineConfiguration);
+                    HttpResponseHandler httpResponseHandler =
+                            createHttpResponseHandler(httpServiceTask.getHttpResponseHandler(), processEngineConfiguration);
                     httpResponseHandler.handleHttpResponse(execution, responseInfo);
                 }
             } catch (Exception e) {
@@ -235,14 +250,10 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
             }
         }
     }
-    
+
     protected void setConfig(final HttpRequestBase base, final HttpRequest requestInfo, final HttpClientConfig config) {
-        base.setConfig(RequestConfig.custom()
-                .setRedirectsEnabled(!requestInfo.isNoRedirects())
-                .setSocketTimeout(config.getSocketTimeout())
-                .setConnectTimeout(config.getConnectTimeout())
-                .setConnectionRequestTimeout(config.getConnectionRequestTimeout())
-                .build());
+        base.setConfig(RequestConfig.custom().setRedirectsEnabled(!requestInfo.isNoRedirects()).setSocketTimeout(config.getSocketTimeout())
+                .setConnectTimeout(config.getConnectTimeout()).setConnectionRequestTimeout(config.getConnectionRequestTimeout()).build());
     }
 
     protected String getHeadersAsString(final Header[] headers) {
@@ -266,53 +277,58 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
                         base.addHeader(headerName, null);
                     }
                     line = reader.readLine();
-                    
+
                 } else {
                     throw new FlowableException(HTTP_TASK_REQUEST_HEADERS_INVALID);
                 }
             }
         }
     }
-    
-    protected HttpRequestHandler createHttpRequestHandler(FlowableHttpRequestHandler handler, ProcessEngineConfigurationImpl processEngineConfiguration) {
+
+    protected HttpRequestHandler createHttpRequestHandler(FlowableHttpRequestHandler handler,
+            ProcessEngineConfigurationImpl processEngineConfiguration) {
         HttpRequestHandler requestHandler = null;
 
         if (ImplementationType.IMPLEMENTATION_TYPE_CLASS.equalsIgnoreCase(handler.getImplementationType())) {
-            requestHandler = new ClassDelegateHttpHandler(handler.getImplementation(), 
-                            createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));
-        
+            requestHandler = new ClassDelegateHttpHandler(handler.getImplementation(),
+                    createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));
+
         } else if (ImplementationType.IMPLEMENTATION_TYPE_DELEGATEEXPRESSION.equalsIgnoreCase(handler.getImplementationType())) {
-            requestHandler = new DelegateExpressionHttpHandler(processEngineConfiguration.getExpressionManager().createExpression(handler.getImplementation()),
-                            createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));   
+            requestHandler =
+                    new DelegateExpressionHttpHandler(processEngineConfiguration.getExpressionManager().createExpression(handler.getImplementation()),
+                            createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));
         }
         return requestHandler;
     }
-    
-    protected HttpResponseHandler createHttpResponseHandler(FlowableHttpResponseHandler handler, ProcessEngineConfigurationImpl processEngineConfiguration) {
+
+    protected HttpResponseHandler createHttpResponseHandler(FlowableHttpResponseHandler handler,
+            ProcessEngineConfigurationImpl processEngineConfiguration) {
         HttpResponseHandler responseHandler = null;
 
         if (ImplementationType.IMPLEMENTATION_TYPE_CLASS.equalsIgnoreCase(handler.getImplementationType())) {
-            responseHandler = new ClassDelegateHttpHandler(handler.getImplementation(), 
-                            createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));
-        
+            responseHandler = new ClassDelegateHttpHandler(handler.getImplementation(),
+                    createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));
+
         } else if (ImplementationType.IMPLEMENTATION_TYPE_DELEGATEEXPRESSION.equalsIgnoreCase(handler.getImplementationType())) {
-            responseHandler = new DelegateExpressionHttpHandler(processEngineConfiguration.getExpressionManager().createExpression(handler.getImplementation()),
-                            createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));   
+            responseHandler =
+                    new DelegateExpressionHttpHandler(processEngineConfiguration.getExpressionManager().createExpression(handler.getImplementation()),
+                            createFieldDeclarations(handler.getFieldExtensions(), processEngineConfiguration));
         }
         return responseHandler;
     }
-    
-    protected List<FieldDeclaration> createFieldDeclarations(List<FieldExtension> fieldList, ProcessEngineConfigurationImpl processEngineConfiguration) {
+
+    protected List<FieldDeclaration> createFieldDeclarations(List<FieldExtension> fieldList,
+            ProcessEngineConfigurationImpl processEngineConfiguration) {
         List<FieldDeclaration> fieldDeclarations = new ArrayList<>();
 
         for (FieldExtension fieldExtension : fieldList) {
             FieldDeclaration fieldDeclaration = null;
             if (StringUtils.isNotEmpty(fieldExtension.getExpression())) {
-                fieldDeclaration = new FieldDeclaration(fieldExtension.getFieldName(), Expression.class.getName(), 
-                                processEngineConfiguration.getExpressionManager().createExpression(fieldExtension.getExpression()));
+                fieldDeclaration = new FieldDeclaration(fieldExtension.getFieldName(), Expression.class.getName(),
+                        processEngineConfiguration.getExpressionManager().createExpression(fieldExtension.getExpression()));
             } else {
-                fieldDeclaration = new FieldDeclaration(fieldExtension.getFieldName(), Expression.class.getName(), 
-                                new FixedValue(fieldExtension.getStringValue()));
+                fieldDeclaration = new FieldDeclaration(fieldExtension.getFieldName(), Expression.class.getName(),
+                        new FixedValue(fieldExtension.getStringValue()));
             }
 
             fieldDeclarations.add(fieldDeclaration);
@@ -334,7 +350,7 @@ public class HttpActivityBehaviorImpl extends HttpActivityBehavior {
             }
         }
     }
-    
+
     public void setServiceTask(ServiceTask serviceTask) {
         this.httpServiceTask = (HttpServiceTask) serviceTask;
     }

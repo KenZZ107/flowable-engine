@@ -1,9 +1,9 @@
 /* Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
- * 
+ *
  *      http://www.apache.org/licenses/LICENSE-2.0
- * 
+ *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -21,6 +21,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.ServiceLoader;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
 
 import javax.sql.DataSource;
 
@@ -43,13 +45,16 @@ import org.flowable.cmmn.engine.impl.agenda.CmmnEngineAgendaFactory;
 import org.flowable.cmmn.engine.impl.agenda.CmmnEngineAgendaSessionFactory;
 import org.flowable.cmmn.engine.impl.agenda.DefaultCmmnEngineAgendaFactory;
 import org.flowable.cmmn.engine.impl.callback.ChildCaseInstanceStateChangeCallback;
+import org.flowable.cmmn.engine.impl.callback.DefaultInternalCmmnJobManager;
 import org.flowable.cmmn.engine.impl.cfg.DelegateExpressionFieldInjectionMode;
 import org.flowable.cmmn.engine.impl.cfg.IdmEngineConfigurator;
 import org.flowable.cmmn.engine.impl.cfg.StandaloneInMemCmmnEngineConfiguration;
+import org.flowable.cmmn.engine.impl.cmd.JobRetryCmd;
 import org.flowable.cmmn.engine.impl.db.CmmnDbSchemaManager;
 import org.flowable.cmmn.engine.impl.db.EntityDependencyOrder;
 import org.flowable.cmmn.engine.impl.delegate.CmmnClassDelegateFactory;
 import org.flowable.cmmn.engine.impl.delegate.DefaultCmmnClassDelegateFactory;
+import org.flowable.cmmn.engine.impl.deployer.CaseDefinitionDiagramHelper;
 import org.flowable.cmmn.engine.impl.deployer.CmmnDeployer;
 import org.flowable.cmmn.engine.impl.deployer.CmmnDeploymentManager;
 import org.flowable.cmmn.engine.impl.el.CmmnExpressionManager;
@@ -58,6 +63,7 @@ import org.flowable.cmmn.engine.impl.history.CmmnHistoryTaskManager;
 import org.flowable.cmmn.engine.impl.history.CmmnHistoryVariableManager;
 import org.flowable.cmmn.engine.impl.history.DefaultCmmnHistoryManager;
 import org.flowable.cmmn.engine.impl.interceptor.CmmnCommandInvoker;
+import org.flowable.cmmn.engine.impl.job.TriggerTimerEventJobHandler;
 import org.flowable.cmmn.engine.impl.parser.CmmnActivityBehaviorFactory;
 import org.flowable.cmmn.engine.impl.parser.CmmnParser;
 import org.flowable.cmmn.engine.impl.parser.CmmnParserImpl;
@@ -106,15 +112,23 @@ import org.flowable.cmmn.engine.impl.runtime.CaseInstanceHelper;
 import org.flowable.cmmn.engine.impl.runtime.CaseInstanceHelperImpl;
 import org.flowable.cmmn.engine.impl.runtime.CmmnRuntimeServiceImpl;
 import org.flowable.cmmn.engine.impl.task.DefaultCmmnTaskVariableScopeResolver;
+import org.flowable.cmmn.image.CaseDiagramGenerator;
+import org.flowable.cmmn.image.impl.DefaultCaseDiagramGenerator;
 import org.flowable.engine.common.AbstractEngineConfiguration;
 import org.flowable.engine.common.EngineConfigurator;
 import org.flowable.engine.common.EngineDeployer;
 import org.flowable.engine.common.api.delegate.FlowableFunctionDelegate;
+import org.flowable.engine.common.impl.calendar.BusinessCalendarManager;
+import org.flowable.engine.common.impl.calendar.CycleBusinessCalendar;
+import org.flowable.engine.common.impl.calendar.DueDateBusinessCalendar;
+import org.flowable.engine.common.impl.calendar.DurationBusinessCalendar;
+import org.flowable.engine.common.impl.calendar.MapBusinessCalendarManager;
 import org.flowable.engine.common.impl.callback.RuntimeInstanceStateChangeCallback;
 import org.flowable.engine.common.impl.cfg.BeansConfigurationHelper;
 import org.flowable.engine.common.impl.db.DbSchemaManager;
 import org.flowable.engine.common.impl.el.ExpressionManager;
 import org.flowable.engine.common.impl.history.HistoryLevel;
+import org.flowable.engine.common.impl.interceptor.Command;
 import org.flowable.engine.common.impl.interceptor.CommandInterceptor;
 import org.flowable.engine.common.impl.interceptor.EngineConfigurationConstants;
 import org.flowable.engine.common.impl.interceptor.SessionFactory;
@@ -126,6 +140,17 @@ import org.flowable.engine.common.impl.persistence.deploy.DeploymentCache;
 import org.flowable.engine.common.impl.util.ReflectUtil;
 import org.flowable.identitylink.service.IdentityLinkServiceConfiguration;
 import org.flowable.identitylink.service.impl.db.IdentityLinkDbSchemaManager;
+import org.flowable.job.service.InternalJobManager;
+import org.flowable.job.service.JobHandler;
+import org.flowable.job.service.JobServiceConfiguration;
+import org.flowable.job.service.impl.asyncexecutor.AsyncExecutor;
+import org.flowable.job.service.impl.asyncexecutor.AsyncRunnableExecutionExceptionHandler;
+import org.flowable.job.service.impl.asyncexecutor.DefaultAsyncJobExecutor;
+import org.flowable.job.service.impl.asyncexecutor.DefaultAsyncRunnableExecutionExceptionHandler;
+import org.flowable.job.service.impl.asyncexecutor.ExecuteAsyncRunnableFactory;
+import org.flowable.job.service.impl.asyncexecutor.FailedJobCommandFactory;
+import org.flowable.job.service.impl.asyncexecutor.JobManager;
+import org.flowable.job.service.impl.db.JobDbSchemaManager;
 import org.flowable.task.service.InternalTaskVariableScopeResolver;
 import org.flowable.task.service.TaskServiceConfiguration;
 import org.flowable.task.service.history.InternalHistoryTaskManager;
@@ -194,7 +219,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected MilestoneInstanceEntityManager milestoneInstanceEntityManager;
     protected HistoricCaseInstanceDataManager historicCaseInstanceDataManager;
     protected HistoricMilestoneInstanceEntityManager historicMilestoneInstanceEntityManager;
-    
+
     // IDM ENGINE /////////////////////////////////////////////////////
     protected boolean disableIdmEngine;
 
@@ -202,6 +227,8 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected CmmnHistoryManager cmmnHistoryManager;
     protected ProcessInstanceService processInstanceService;
     protected Map<String, List<RuntimeInstanceStateChangeCallback>> caseInstanceStateChangeCallbacks;
+    
+    protected boolean executeServiceDbSchemaManagers = true;
 
     protected boolean enableSafeCmmnXml;
     protected CmmnActivityBehaviorFactory activityBehaviorFactory;
@@ -209,16 +236,17 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected CmmnParser cmmnParser;
     protected CmmnDeployer cmmnDeployer;
     protected CmmnDeploymentManager deploymentManager;
+    protected CaseDefinitionDiagramHelper caseDefinitionDiagramHelper;
 
     protected int caseDefinitionCacheLimit = -1;
     protected DeploymentCache<CaseDefinitionCacheEntry> caseDefinitionCache;
-    
+
     protected HistoryLevel historyLevel = HistoryLevel.AUDIT;
-    
+
     protected ExpressionManager expressionManager;
     protected List<FlowableFunctionDelegate> flowableFunctionDelegates;
     protected List<FlowableFunctionDelegate> customFlowableFunctionDelegates;
-    
+
     /**
      * Using field injection together with a delegate expression for a service task / execution listener / task listener is not thread-sade , see user guide section 'Field Injection' for more
      * information.
@@ -230,17 +258,29 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected DbSchemaManager identityLinkDbSchemaManager;
     protected DbSchemaManager variableDbSchemaManager;
     protected DbSchemaManager taskDbSchemaManager;
+    protected DbSchemaManager jobDbSchemaManager;
     
+    /**
+     * Case diagram generator. Default value is DefaultCaseDiagramGenerator
+     */
+    protected CaseDiagramGenerator caseDiagramGenerator;
+
+    protected boolean isCreateDiagramOnDeploy = true;
+
+    protected String activityFontName = "Arial";
+    protected String labelFontName = "Arial";
+    protected String annotationFontName = "Arial";
+
     // CONFIGURATORS ////////////////////////////////////////////////////////////
 
     protected boolean enableConfiguratorServiceLoader = true; // Enabled by default. In certain environments this should be set to false (eg osgi)
     protected List<EngineConfigurator> configurators; // The injected configurators
     protected List<EngineConfigurator> allConfigurators; // Including auto-discovered configurators
     protected EngineConfigurator idmEngineConfigurator;
-    
+
     // Identitylink support
     protected IdentityLinkServiceConfiguration identityLinkServiceConfiguration;
-    
+
     // Task support
     protected TaskServiceConfiguration taskServiceConfiguration;
     protected InternalHistoryTaskManager internalHistoryTaskManager;
@@ -248,7 +288,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected boolean isEnableTaskRelationshipCounts;
     protected int taskQueryLimit;
     protected int historicTaskQueryLimit;
-    
+
     // Variable support
     protected VariableTypes variableTypes;
     protected List<VariableType> customPreVariableTypes;
@@ -257,6 +297,225 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected InternalHistoryVariableManager internalHistoryVariableManager;
     protected boolean serializableVariableTypeTrackDeserializedObjects = true;
     protected ObjectMapper objectMapper = new ObjectMapper();
+
+    // Set Http Client config defaults
+    protected HttpClientConfig httpClientConfig = new HttpClientConfig();
+    
+    // Async executor
+    protected JobServiceConfiguration jobServiceConfiguration;
+    
+    protected AsyncExecutor asyncExecutor;
+    protected JobManager jobManager;
+    protected List<JobHandler> customJobHandlers;
+    protected Map<String, JobHandler> jobHandlers;
+    protected InternalJobManager internalJobManager;
+    protected List<AsyncRunnableExecutionExceptionHandler> customAsyncRunnableExecutionExceptionHandlers;
+    protected boolean addDefaultExceptionHandler = true;
+    protected FailedJobCommandFactory failedJobCommandFactory;
+    
+    /**
+     * Boolean flag to be set to activate the {@link AsyncExecutor} automatically after the engine has booted up.
+     */
+    protected boolean asyncExecutorActivate;
+    
+    /**
+     * Experimental!
+     * <p>
+     * Set this to true when using the message queue based job executor.
+     */
+    protected boolean asyncExecutorMessageQueueMode;
+    
+    /**
+     * The number of retries for a job.
+     */
+    protected int asyncExecutorNumberOfRetries = 3;
+    
+    /**
+     * Define the default lock time for an async job in seconds. 
+     * The lock time is used when creating an async job and when it expires the async executor assumes that the job has failed. 
+     * It will be retried again.
+     */
+    protected int lockTimeAsyncJobWaitTime = 60;
+    
+    /** 
+     * Define the default wait time for a failed job in seconds 
+     */
+    protected int defaultFailedJobWaitTime = 10;
+    
+    /** 
+     * Defines the default wait time for a failed async job in seconds 
+     */
+    protected int asyncFailedJobWaitTime = 10;
+
+    /**
+     * The minimal number of threads that are kept alive in the threadpool for job execution. 
+     * Default value = 2.
+     * 
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorCorePoolSize = 2;
+
+    /**
+     * The maximum number of threads that are created in the threadpool for job execution. 
+     * Default value = 10.
+     * 
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorMaxPoolSize = 10;
+
+    /**
+     * The time (in milliseconds) a thread used for job execution must be kept alive before it is destroyed. 
+     * Default setting is 5 seconds. Having a setting > 0 takes resources, but in the case of many
+     * job executions it avoids creating new threads all the time. 
+     * If 0, threads will be destroyed after they've been used for job execution.
+     * 
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected long asyncExecutorThreadKeepAliveTime = 5000L;
+
+    /**
+     * The size of the queue on which jobs to be executed are placed, before they are actually executed. 
+     * Default value = 100.
+     * 
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorThreadPoolQueueSize = 100;
+
+    /**
+     * The queue onto which jobs will be placed before they are actually executed. 
+     * Threads form the async executor threadpool will take work from this queue.
+     * <p>
+     * By default null. If null, an {@link ArrayBlockingQueue} will be created of size {@link #asyncExecutorThreadPoolQueueSize}.
+     * <p>
+     * When the queue is full, the job will be executed by the calling thread (ThreadPoolExecutor.CallerRunsPolicy())
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected BlockingQueue<Runnable> asyncExecutorThreadPoolQueue;
+
+    /**
+     * The time (in seconds) that is waited to gracefully shut down the threadpool used for job execution when
+     * a shutdown on the executor (or engine) is requested. Default value = 60.
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected long asyncExecutorSecondsToWaitOnShutdown = 60L;
+
+    /**
+     * The number of timer jobs that are acquired during one query 
+     * Before a job is executed, an acquirement thread fetches jobs from the database and puts them on the queue.
+     * <p>
+     * Default value = 1, as this lowers the potential on optimistic locking exceptions. 
+     * A larger value means more timer jobs will be fetched in one request.
+     * Change this value if you know what you are doing.
+     * <p>
+     */
+    protected int asyncExecutorMaxTimerJobsPerAcquisition = 1;
+
+    /**
+     * The number of async jobs that are acquired during one query (before a job is executed, 
+     * an acquirement thread fetches jobs from the database and puts them on the queue).
+     * <p>
+     * Default value = 1, as this lowers the potential on optimistic locking exceptions. 
+     * A larger value means more jobs will be fetched at the same time.
+     * Change this value if you know what you are doing.
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorMaxAsyncJobsDuePerAcquisition = 1;
+
+    /**
+     * The time (in milliseconds) the timer acquisition thread will wait to execute the next acquirement query. 
+     * This happens when no new timer jobs were found or when less timer jobs have been fetched
+     * than set in {@link #asyncExecutorMaxTimerJobsPerAcquisition}. Default value = 10 seconds.
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorDefaultTimerJobAcquireWaitTime = 10 * 1000;
+
+    /**
+     * The time (in milliseconds) the async job acquisition thread will wait to execute the next acquirement query. 
+     * This happens when no new async jobs were found or when less async jobs have been
+     * fetched than set in {@link #asyncExecutorMaxAsyncJobsDuePerAcquisition}. Default value = 10 seconds.
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorDefaultAsyncJobAcquireWaitTime = 10 * 1000;
+
+    /**
+     * The time (in milliseconds) the async job (both timer and async continuations) acquisition thread will wait 
+     * when the queue is full to execute the next query. By default set to 0 (for backwards compatibility)
+     */
+    protected int asyncExecutorDefaultQueueSizeFullWaitTime;
+
+    /**
+     * When a job is acquired, it is locked so other async executors can't lock and execute it. 
+     * While doing this, the 'name' of the lock owner is written into a column of the job.
+     * <p>
+     * By default, a random UUID will be generated when the executor is created.
+     * <p>
+     * It is important that each async executor instance in a cluster of Flowable engines has a different name!
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected String asyncExecutorLockOwner;
+
+    /**
+     * The amount of time (in milliseconds) a timer job is locked when acquired by the async executor. 
+     * During this period of time, no other async executor will try to acquire and lock this job.
+     * <p>
+     * Default value = 5 minutes;
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorTimerLockTimeInMillis = 5 * 60 * 1000;
+
+    /**
+     * The amount of time (in milliseconds) an async job is locked when acquired by the async executor. 
+     * During this period of time, no other async executor will try to acquire and lock this job.
+     * <p>
+     * Default value = 5 minutes;
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected int asyncExecutorAsyncJobLockTimeInMillis = 5 * 60 * 1000;
+
+    /**
+     * The amount of time (in milliseconds) that is between two consecutive checks of 'expired jobs'. 
+     * Expired jobs are jobs that were locked (a lock owner + time was written by some executor, but the job was never completed).
+     * <p>
+     * During such a check, jobs that are expired are again made available, meaning the lock owner and lock time will be removed. 
+     * Other executors will now be able to pick it up.
+     * <p>
+     * A job is deemed expired if the current time has passed the lock time.
+     * <p>
+     * By default one minute.
+     */
+    protected int asyncExecutorResetExpiredJobsInterval = 60 * 1000;
+
+    /**
+     * The amount of time (in milliseconds) a job can maximum be in the 'executable' state before being deemed expired.
+     * Note that this won't happen when using the threadpool based executor, as the acquire thread will fetch these kind of jobs earlier.
+     * However, in the message queue based execution, it could be some job is posted to a queue but then never is locked nor executed.
+     * <p>
+     * By default 24 hours, as this should be a very exceptional case.
+     */
+    protected int asyncExecutorResetExpiredJobsMaxTimeout = 24 * 60 * 60 * 1000;
+
+    /**
+     * The default {@link AsyncExecutor} has a 'cleanup' thread that resets expired jobs so they can be re-acquired by other executors. 
+     * This setting defines the size of the page being used when fetching these expired jobs.
+     */
+    protected int asyncExecutorResetExpiredJobsPageSize = 3;
+    
+    protected BusinessCalendarManager businessCalendarManager;
+
+    /**
+     * Allows to define a custom factory for creating the {@link Runnable} that is executed by the async executor.
+     * <p>
+     * This property is only applicable when using the threadpool-based async executor.
+     */
+    protected ExecuteAsyncRunnableFactory asyncExecutorExecuteAsyncRunnableFactory;
 
     public static CmmnEngineConfiguration createCmmnEngineConfigurationFromResourceDefault() {
         return createCmmnEngineConfigurationFromResource("flowable.cmmn.cfg.xml", "cmmnEngineConfiguration");
@@ -294,6 +553,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected void init() {
         initConfigurators();
         configuratorsBeforeInit();
+        initCaseDiagramGenerator();
         initCommandContextFactory();
         initTransactionContextFactory();
         initCommandExecutors();
@@ -329,17 +589,32 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         initClock();
         initIdentityLinkServiceConfiguration();
         initVariableServiceConfiguration();
+        configuratorsAfterInit();
         initTaskServiceConfiguration();
+        initBusinessCalendarManager();
+        initJobHandlers();
+        initFailedJobCommandFactory();
+        initJobServiceConfiguration();
+        initAsyncExecutor();
+    }
+
+    public void initCaseDiagramGenerator() {
+        if (caseDiagramGenerator == null) {
+            caseDiagramGenerator = new DefaultCaseDiagramGenerator();
+        }
     }
 
     @Override
-
     public void initDbSchemaManager() {
         super.initDbSchemaManager();
         initCmmnDbSchemaManager();
-        initIdentityLinkDbSchemaManager();
-        initVariableDbSchemaManager();
-        initTaskDbSchemaManager();
+        
+        if (executeServiceDbSchemaManagers) {
+            initIdentityLinkDbSchemaManager();
+            initVariableDbSchemaManager();
+            initTaskDbSchemaManager();
+            initJobDbSchemaManager();
+        }
     }
 
     protected void initCmmnDbSchemaManager() {
@@ -359,10 +634,16 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
             this.taskDbSchemaManager = new TaskDbSchemaManager();
         }
     }
-    
+
     protected void initIdentityLinkDbSchemaManager() {
         if (this.identityLinkDbSchemaManager == null) {
             this.identityLinkDbSchemaManager = new IdentityLinkDbSchemaManager();
+        }
+    }
+    
+    protected void initJobDbSchemaManager() {
+        if (this.jobDbSchemaManager == null) {
+            this.jobDbSchemaManager = new JobDbSchemaManager();
         }
     }
 
@@ -370,7 +651,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     public void initMybatisTypeHandlers(Configuration configuration) {
         configuration.getTypeHandlerRegistry().register(VariableType.class, JdbcType.VARCHAR, new IbatisVariableTypeHandler(variableTypes));
     }
-    
+
     public void initExpressionManager() {
         if (expressionManager == null) {
             expressionManager = new CmmnExpressionManager(beans);
@@ -420,7 +701,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
 
     protected void initServices() {
         initService(cmmnRuntimeService);
-        initService(cmmnTaskService);;
+        initService(cmmnTaskService);
         initService(cmmnManagementService);
         initService(cmmnRepositoryService);
         initService(cmmnHistoryService);
@@ -532,9 +813,11 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         }
 
         initCmmnParser();
+        initCaseDefinitionDiagramHelper();
 
         cmmnDeployer.setIdGenerator(idGenerator);
         cmmnDeployer.setCmmnParser(cmmnParser);
+        cmmnDeployer.setCaseDefinitionDiagramHelper(caseDefinitionDiagramHelper);
 
         defaultDeployers.add(cmmnDeployer);
         return defaultDeployers;
@@ -567,6 +850,12 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
             cmmnParserImpl.setActivityBehaviorFactory(activityBehaviorFactory);
             cmmnParserImpl.setExpressionManager(expressionManager);
             cmmnParser = cmmnParserImpl;
+        }
+    }
+
+    public void initCaseDefinitionDiagramHelper() {
+        if (caseDefinitionDiagramHelper == null) {
+            caseDefinitionDiagramHelper = new CaseDefinitionDiagramHelper();
         }
     }
 
@@ -613,7 +902,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     protected void initDbSqlSessionFactoryEntitySettings() {
         defaultInitDbSqlSessionFactoryEntitySettings(EntityDependencyOrder.INSERT_ORDER, EntityDependencyOrder.DELETE_ORDER);
     }
-    
+
     public void initConfigurators() {
 
         allConfigurators = new ArrayList<>();
@@ -685,7 +974,14 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
             configurator.beforeInit(this);
         }
     }
-    
+
+    public void configuratorsAfterInit() {
+        for (EngineConfigurator configurator : allConfigurators) {
+            LOGGER.info("Executing configure() of {} (priority:{})", configurator.getClass(), configurator.getPriority());
+            configurator.configure(this);
+        }
+    }
+
     public void initVariableTypes() {
         if (variableTypes == null) {
             variableTypes = new DefaultVariableTypes();
@@ -717,17 +1013,17 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
             }
         }
     }
-    
+
     public void initVariableServiceConfiguration() {
         this.variableServiceConfiguration = new VariableServiceConfiguration();
-        
+
         this.variableServiceConfiguration.setHistoryLevel(this.historyLevel);
         this.variableServiceConfiguration.setClock(this.clock);
         this.variableServiceConfiguration.setObjectMapper(this.objectMapper);
         this.variableServiceConfiguration.setEventDispatcher(this.eventDispatcher);
 
         this.variableServiceConfiguration.setVariableTypes(this.variableTypes);
-        
+
         if (this.internalHistoryVariableManager != null) {
             this.variableServiceConfiguration.setInternalHistoryVariableManager(this.internalHistoryVariableManager);
         } else {
@@ -741,7 +1037,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
 
         addServiceConfiguration(EngineConfigurationConstants.KEY_VARIABLE_SERVICE_CONFIG, this.variableServiceConfiguration);
     }
-    
+
     public void initTaskServiceConfiguration() {
         this.taskServiceConfiguration = new TaskServiceConfiguration();
         this.taskServiceConfiguration.setHistoryLevel(this.historyLevel);
@@ -769,7 +1065,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
 
         addServiceConfiguration(EngineConfigurationConstants.KEY_TASK_SERVICE_CONFIG, this.taskServiceConfiguration);
     }
-    
+
     public void initIdentityLinkServiceConfiguration() {
         this.identityLinkServiceConfiguration = new IdentityLinkServiceConfiguration();
         this.identityLinkServiceConfiguration.setHistoryLevel(this.historyLevel);
@@ -780,6 +1076,131 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.identityLinkServiceConfiguration.init();
 
         addServiceConfiguration(EngineConfigurationConstants.KEY_IDENTITY_LINK_SERVICE_CONFIG, this.identityLinkServiceConfiguration);
+    }
+    
+    public void initBusinessCalendarManager() {
+        if (businessCalendarManager == null) {
+            MapBusinessCalendarManager mapBusinessCalendarManager = new MapBusinessCalendarManager();
+            mapBusinessCalendarManager.addBusinessCalendar(DurationBusinessCalendar.NAME, new DurationBusinessCalendar(this.clock));
+            mapBusinessCalendarManager.addBusinessCalendar(DueDateBusinessCalendar.NAME, new DueDateBusinessCalendar(this.clock));
+            mapBusinessCalendarManager.addBusinessCalendar(CycleBusinessCalendar.NAME, new CycleBusinessCalendar(this.clock));
+
+            businessCalendarManager = mapBusinessCalendarManager;
+        }
+    }
+    
+    public void initJobHandlers() {
+        jobHandlers = new HashMap<>();
+        jobHandlers.put(TriggerTimerEventJobHandler.TYPE, new TriggerTimerEventJobHandler());
+
+        // if we have custom job handlers, register them
+        if (customJobHandlers != null) {
+            for (JobHandler customJobHandler : customJobHandlers) {
+                jobHandlers.put(customJobHandler.getType(), customJobHandler);
+            }
+        }
+    }
+    
+    public void initFailedJobCommandFactory() {
+        if (this.failedJobCommandFactory == null) {
+            this.failedJobCommandFactory = new FailedJobCommandFactory() {
+                @Override
+                public Command<Object> getCommand(String jobId, Throwable exception) {
+                    return new JobRetryCmd(jobId, exception);
+                }
+            };
+        }
+    }
+    
+    public void initJobServiceConfiguration() {
+        this.jobServiceConfiguration = new JobServiceConfiguration();
+        this.jobServiceConfiguration.setHistoryLevel(this.historyLevel);
+        this.jobServiceConfiguration.setClock(this.clock);
+        this.jobServiceConfiguration.setObjectMapper(this.objectMapper);
+        this.jobServiceConfiguration.setEventDispatcher(this.eventDispatcher);
+        this.jobServiceConfiguration.setCommandExecutor(this.commandExecutor);
+        this.jobServiceConfiguration.setExpressionManager(this.expressionManager);
+        this.jobServiceConfiguration.setBusinessCalendarManager(this.businessCalendarManager);
+
+        this.jobServiceConfiguration.setJobHandlers(this.jobHandlers);
+        this.jobServiceConfiguration.setFailedJobCommandFactory(this.failedJobCommandFactory);
+        
+        List<AsyncRunnableExecutionExceptionHandler> exceptionHandlers = new ArrayList<>();
+        if (customAsyncRunnableExecutionExceptionHandlers != null) {
+            exceptionHandlers.addAll(customAsyncRunnableExecutionExceptionHandlers);
+        }
+        
+        if (addDefaultExceptionHandler) {
+            exceptionHandlers.add(new DefaultAsyncRunnableExecutionExceptionHandler());
+        }
+        
+        this.jobServiceConfiguration.setAsyncRunnableExecutionExceptionHandlers(exceptionHandlers);
+        this.jobServiceConfiguration.setAsyncExecutorNumberOfRetries(this.asyncExecutorNumberOfRetries);
+        this.jobServiceConfiguration.setAsyncExecutorResetExpiredJobsMaxTimeout(this.asyncExecutorResetExpiredJobsMaxTimeout);
+
+        if (this.jobManager != null) {
+            this.jobServiceConfiguration.setJobManager(this.jobManager);
+        }
+
+        if (this.internalJobManager != null) {
+            this.jobServiceConfiguration.setInternalJobManager(this.internalJobManager);
+        } else {
+            this.jobServiceConfiguration.setInternalJobManager(new DefaultInternalCmmnJobManager(this));
+        }
+
+        this.jobServiceConfiguration.init();
+
+        addServiceConfiguration(EngineConfigurationConstants.KEY_JOB_SERVICE_CONFIG, this.jobServiceConfiguration);
+    }
+    
+    public void initAsyncExecutor() {
+        if (asyncExecutor == null) {
+            DefaultAsyncJobExecutor defaultAsyncExecutor = new DefaultAsyncJobExecutor();
+            if (asyncExecutorExecuteAsyncRunnableFactory != null) {
+                defaultAsyncExecutor.setExecuteAsyncRunnableFactory(asyncExecutorExecuteAsyncRunnableFactory);
+            }
+
+            // Message queue mode
+            defaultAsyncExecutor.setMessageQueueMode(asyncExecutorMessageQueueMode);
+
+            // Thread pool config
+            defaultAsyncExecutor.setCorePoolSize(asyncExecutorCorePoolSize);
+            defaultAsyncExecutor.setMaxPoolSize(asyncExecutorMaxPoolSize);
+            defaultAsyncExecutor.setKeepAliveTime(asyncExecutorThreadKeepAliveTime);
+
+            // Threadpool queue
+            if (asyncExecutorThreadPoolQueue != null) {
+                defaultAsyncExecutor.setThreadPoolQueue(asyncExecutorThreadPoolQueue);
+            }
+            defaultAsyncExecutor.setQueueSize(asyncExecutorThreadPoolQueueSize);
+
+            // Acquisition wait time
+            defaultAsyncExecutor.setDefaultTimerJobAcquireWaitTimeInMillis(asyncExecutorDefaultTimerJobAcquireWaitTime);
+            defaultAsyncExecutor.setDefaultAsyncJobAcquireWaitTimeInMillis(asyncExecutorDefaultAsyncJobAcquireWaitTime);
+
+            // Queue full wait time
+            defaultAsyncExecutor.setDefaultQueueSizeFullWaitTimeInMillis(asyncExecutorDefaultQueueSizeFullWaitTime);
+
+            // Job locking
+            defaultAsyncExecutor.setTimerLockTimeInMillis(asyncExecutorTimerLockTimeInMillis);
+            defaultAsyncExecutor.setAsyncJobLockTimeInMillis(asyncExecutorAsyncJobLockTimeInMillis);
+            if (asyncExecutorLockOwner != null) {
+                defaultAsyncExecutor.setLockOwner(asyncExecutorLockOwner);
+            }
+
+            // Reset expired
+            defaultAsyncExecutor.setResetExpiredJobsInterval(asyncExecutorResetExpiredJobsInterval);
+            defaultAsyncExecutor.setResetExpiredJobsPageSize(asyncExecutorResetExpiredJobsPageSize);
+
+            // Shutdown
+            defaultAsyncExecutor.setSecondsToWaitOnShutdown(asyncExecutorSecondsToWaitOnShutdown);
+
+            asyncExecutor = defaultAsyncExecutor;
+        }
+
+        asyncExecutor.setJobServiceConfiguration(jobServiceConfiguration);
+        asyncExecutor.setAutoActivate(asyncExecutorActivate);
+        jobServiceConfiguration.setAsyncExecutor(asyncExecutor);
     }
 
     @Override
@@ -805,7 +1226,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.cmmnRuntimeService = cmmnRuntimeService;
         return this;
     }
-    
+
     public CmmnTaskService getCmmnTaskService() {
         return cmmnTaskService;
     }
@@ -1079,6 +1500,15 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         return this;
     }
 
+    public CaseDefinitionDiagramHelper getCaseDefinitionDiagramHelper() {
+        return caseDefinitionDiagramHelper;
+    }
+
+    public CmmnEngineConfiguration setCaseDefinitionDiagramHelper(CaseDefinitionDiagramHelper caseDefinitionDiagramHelper) {
+        this.caseDefinitionDiagramHelper = caseDefinitionDiagramHelper;
+        return this;
+    }
+
     public CmmnActivityBehaviorFactory getActivityBehaviorFactory() {
         return activityBehaviorFactory;
     }
@@ -1132,11 +1562,19 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.caseInstanceStateChangeCallbacks = caseInstanceStateChangeCallbacks;
         return this;
     }
-    
+
     @Override
     public CmmnEngineConfiguration setDataSource(DataSource dataSource) {
         this.dataSource = dataSource;
         return this;
+    }
+
+    public boolean isExecuteServiceDbSchemaManagers() {
+        return executeServiceDbSchemaManagers;
+    }
+
+    public void setExecuteServiceDbSchemaManagers(boolean executeServiceDbSchemaManagers) {
+        this.executeServiceDbSchemaManagers = executeServiceDbSchemaManagers;
     }
 
     public HistoryLevel getHistoryLevel() {
@@ -1147,7 +1585,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.historyLevel = historyLevel;
         return this;
     }
-    
+
     public ExpressionManager getExpressionManager() {
         return expressionManager;
     }
@@ -1183,7 +1621,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.customFlowableFunctionDelegates = customFlowableFunctionDelegates;
         return this;
     }
-    
+
     public DbSchemaManager getIdentityLinkDbSchemaManager() {
         return identityLinkDbSchemaManager;
     }
@@ -1201,13 +1639,22 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.variableDbSchemaManager = variableDbSchemaManager;
         return this;
     }
-    
+
     public DbSchemaManager getTaskDbSchemaManager() {
         return taskDbSchemaManager;
     }
 
     public CmmnEngineConfiguration setTaskDbSchemaManager(DbSchemaManager taskDbSchemaManager) {
         this.taskDbSchemaManager = taskDbSchemaManager;
+        return this;
+    }
+    
+    public DbSchemaManager getJobDbSchemaManager() {
+        return jobDbSchemaManager;
+    }
+
+    public CmmnEngineConfiguration setJobDbSchemaManager(DbSchemaManager jobDbSchemaManager) {
+        this.jobDbSchemaManager = jobDbSchemaManager;
         return this;
     }
 
@@ -1219,7 +1666,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.variableTypes = variableTypes;
         return this;
     }
-    
+
     public List<VariableType> getCustomPreVariableTypes() {
         return customPreVariableTypes;
     }
@@ -1237,7 +1684,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.customPostVariableTypes = customPostVariableTypes;
         return this;
     }
-    
+
     public IdentityLinkServiceConfiguration getIdentityLinkServiceConfiguration() {
         return identityLinkServiceConfiguration;
     }
@@ -1255,7 +1702,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.variableServiceConfiguration = variableServiceConfiguration;
         return this;
     }
-    
+
     public TaskServiceConfiguration getTaskServiceConfiguration() {
         return taskServiceConfiguration;
     }
@@ -1264,7 +1711,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.taskServiceConfiguration = taskServiceConfiguration;
         return this;
     }
-    
+
     public InternalHistoryTaskManager getInternalHistoryTaskManager() {
         return internalHistoryTaskManager;
     }
@@ -1273,7 +1720,7 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         this.internalHistoryTaskManager = internalHistoryTaskManager;
         return this;
     }
-    
+
     public InternalTaskVariableScopeResolver getInternalTaskVariableScopeResolver() {
         return internalTaskVariableScopeResolver;
     }
@@ -1328,6 +1775,51 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
         return this;
     }
 
+    public CaseDiagramGenerator getCaseDiagramGenerator() {
+        return caseDiagramGenerator;
+    }
+
+    public CmmnEngineConfiguration setCaseDiagramGenerator(CaseDiagramGenerator caseDiagramGenerator) {
+        this.caseDiagramGenerator = caseDiagramGenerator;
+        return this;
+    }
+
+    public boolean isCreateDiagramOnDeploy() {
+        return isCreateDiagramOnDeploy;
+    }
+
+    public CmmnEngineConfiguration setCreateDiagramOnDeploy(boolean isCreateDiagramOnDeploy) {
+        this.isCreateDiagramOnDeploy = isCreateDiagramOnDeploy;
+        return this;
+    }
+
+    public String getActivityFontName() {
+        return activityFontName;
+    }
+
+    public CmmnEngineConfiguration setActivityFontName(String activityFontName) {
+        this.activityFontName = activityFontName;
+        return this;
+    }
+
+    public String getLabelFontName() {
+        return labelFontName;
+    }
+
+    public CmmnEngineConfiguration setLabelFontName(String labelFontName) {
+        this.labelFontName = labelFontName;
+        return this;
+    }
+
+    public String getAnnotationFontName() {
+        return annotationFontName;
+    }
+
+    public CmmnEngineConfiguration setAnnotationFontName(String annotationFontName) {
+        this.annotationFontName = annotationFontName;
+        return this;
+    }
+
     public ObjectMapper getObjectMapper() {
         return objectMapper;
     }
@@ -1335,6 +1827,358 @@ public class CmmnEngineConfiguration extends AbstractEngineConfiguration impleme
     public CmmnEngineConfiguration setObjectMapper(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
         return this;
+    }
+
+    public boolean isDisableIdmEngine() {
+        return disableIdmEngine;
+    }
+
+    public CmmnEngineConfiguration setDisableIdmEngine(boolean disableIdmEngine) {
+        this.disableIdmEngine = disableIdmEngine;
+        return this;
+    }
+
+    public boolean isEnableConfiguratorServiceLoader() {
+        return enableConfiguratorServiceLoader;
+    }
+
+    public CmmnEngineConfiguration setEnableConfiguratorServiceLoader(boolean enableConfiguratorServiceLoader) {
+        this.enableConfiguratorServiceLoader = enableConfiguratorServiceLoader;
+        return this;
+    }
+
+    public List<EngineConfigurator> getConfigurators() {
+        return configurators;
+    }
+
+    public CmmnEngineConfiguration setConfigurators(List<EngineConfigurator> configurators) {
+        this.configurators = configurators;
+        return this;
+    }
+
+    public EngineConfigurator getIdmEngineConfigurator() {
+        return idmEngineConfigurator;
+    }
+
+    public CmmnEngineConfiguration setIdmEngineConfigurator(EngineConfigurator idmEngineConfigurator) {
+        this.idmEngineConfigurator = idmEngineConfigurator;
+        return this;
+    }
+    
+    public JobServiceConfiguration getJobServiceConfiguration() {
+        return jobServiceConfiguration;
+    }
+
+    public CmmnEngineConfiguration setJobServiceConfiguration(JobServiceConfiguration jobServiceConfiguration) {
+        this.jobServiceConfiguration = jobServiceConfiguration;
+        return this;
+    }
+
+    public JobManager getJobManager() {
+        return jobManager;
+    }
+
+    public CmmnEngineConfiguration setJobManager(JobManager jobManager) {
+        this.jobManager = jobManager;
+        return this;
+    }
+
+    public List<JobHandler> getCustomJobHandlers() {
+        return customJobHandlers;
+    }
+
+    public CmmnEngineConfiguration setCustomJobHandlers(List<JobHandler> customJobHandlers) {
+        this.customJobHandlers = customJobHandlers;
+        return this;
+    }
+
+    public Map<String, JobHandler> getJobHandlers() {
+        return jobHandlers;
+    }
+
+    public CmmnEngineConfiguration setJobHandlers(Map<String, JobHandler> jobHandlers) {
+        this.jobHandlers = jobHandlers;
+        return this;
+    }
+    
+    public InternalJobManager getInternalJobManager() {
+        return internalJobManager;
+    }
+
+    public CmmnEngineConfiguration setInternalJobManager(InternalJobManager internalJobManager) {
+        this.internalJobManager = internalJobManager;
+        return this;
+    }
+
+    public List<AsyncRunnableExecutionExceptionHandler> getCustomAsyncRunnableExecutionExceptionHandlers() {
+        return customAsyncRunnableExecutionExceptionHandlers;
+    }
+
+    public CmmnEngineConfiguration setCustomAsyncRunnableExecutionExceptionHandlers(
+            List<AsyncRunnableExecutionExceptionHandler> customAsyncRunnableExecutionExceptionHandlers) {
+        this.customAsyncRunnableExecutionExceptionHandlers = customAsyncRunnableExecutionExceptionHandlers;
+        return this;
+    }
+
+    public boolean isAddDefaultExceptionHandler() {
+        return addDefaultExceptionHandler;
+    }
+
+    public CmmnEngineConfiguration setAddDefaultExceptionHandler(boolean addDefaultExceptionHandler) {
+        this.addDefaultExceptionHandler = addDefaultExceptionHandler;
+        return this;
+    }
+    
+    public FailedJobCommandFactory getFailedJobCommandFactory() {
+        return failedJobCommandFactory;
+    }
+
+    public CmmnEngineConfiguration setFailedJobCommandFactory(FailedJobCommandFactory failedJobCommandFactory) {
+        this.failedJobCommandFactory = failedJobCommandFactory;
+        return this;
+    }
+
+    public BusinessCalendarManager getBusinessCalendarManager() {
+        return businessCalendarManager;
+    }
+
+    public CmmnEngineConfiguration setBusinessCalendarManager(BusinessCalendarManager businessCalendarManager) {
+        this.businessCalendarManager = businessCalendarManager;
+        return this;
+    }
+
+    public AsyncExecutor getAsyncExecutor() {
+        return asyncExecutor;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutor(AsyncExecutor asyncExecutor) {
+        this.asyncExecutor = asyncExecutor;
+        return this;
+    }
+
+    public boolean isAsyncExecutorActivate() {
+        return asyncExecutorActivate;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorActivate(boolean asyncExecutorActivate) {
+        this.asyncExecutorActivate = asyncExecutorActivate;
+        return this;
+    }
+
+    public boolean isAsyncExecutorMessageQueueMode() {
+        return asyncExecutorMessageQueueMode;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorMessageQueueMode(boolean asyncExecutorMessageQueueMode) {
+        this.asyncExecutorMessageQueueMode = asyncExecutorMessageQueueMode;
+        return this;
+    }
+
+    public int getAsyncExecutorNumberOfRetries() {
+        return asyncExecutorNumberOfRetries;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorNumberOfRetries(int asyncExecutorNumberOfRetries) {
+        this.asyncExecutorNumberOfRetries = asyncExecutorNumberOfRetries;
+        return this;
+    }
+    
+    public int getLockTimeAsyncJobWaitTime() {
+        return lockTimeAsyncJobWaitTime;
+    }
+
+    public CmmnEngineConfiguration setLockTimeAsyncJobWaitTime(int lockTimeAsyncJobWaitTime) {
+        this.lockTimeAsyncJobWaitTime = lockTimeAsyncJobWaitTime;
+        return this;
+    }
+
+    public int getDefaultFailedJobWaitTime() {
+        return defaultFailedJobWaitTime;
+    }
+
+    public CmmnEngineConfiguration setDefaultFailedJobWaitTime(int defaultFailedJobWaitTime) {
+        this.defaultFailedJobWaitTime = defaultFailedJobWaitTime;
+        return this;
+    }
+
+    public int getAsyncFailedJobWaitTime() {
+        return asyncFailedJobWaitTime;
+    }
+
+    public CmmnEngineConfiguration setAsyncFailedJobWaitTime(int asyncFailedJobWaitTime) {
+        this.asyncFailedJobWaitTime = asyncFailedJobWaitTime;
+        return this;
+    }
+
+    public int getAsyncExecutorCorePoolSize() {
+        return asyncExecutorCorePoolSize;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorCorePoolSize(int asyncExecutorCorePoolSize) {
+        this.asyncExecutorCorePoolSize = asyncExecutorCorePoolSize;
+        return this;
+    }
+
+    public int getAsyncExecutorMaxPoolSize() {
+        return asyncExecutorMaxPoolSize;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorMaxPoolSize(int asyncExecutorMaxPoolSize) {
+        this.asyncExecutorMaxPoolSize = asyncExecutorMaxPoolSize;
+        return this;
+    }
+
+    public long getAsyncExecutorThreadKeepAliveTime() {
+        return asyncExecutorThreadKeepAliveTime;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorThreadKeepAliveTime(long asyncExecutorThreadKeepAliveTime) {
+        this.asyncExecutorThreadKeepAliveTime = asyncExecutorThreadKeepAliveTime;
+        return this;
+    }
+
+    public int getAsyncExecutorThreadPoolQueueSize() {
+        return asyncExecutorThreadPoolQueueSize;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorThreadPoolQueueSize(int asyncExecutorThreadPoolQueueSize) {
+        this.asyncExecutorThreadPoolQueueSize = asyncExecutorThreadPoolQueueSize;
+        return this;
+    }
+
+    public BlockingQueue<Runnable> getAsyncExecutorThreadPoolQueue() {
+        return asyncExecutorThreadPoolQueue;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorThreadPoolQueue(BlockingQueue<Runnable> asyncExecutorThreadPoolQueue) {
+        this.asyncExecutorThreadPoolQueue = asyncExecutorThreadPoolQueue;
+        return this;
+    }
+
+    public long getAsyncExecutorSecondsToWaitOnShutdown() {
+        return asyncExecutorSecondsToWaitOnShutdown;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorSecondsToWaitOnShutdown(long asyncExecutorSecondsToWaitOnShutdown) {
+        this.asyncExecutorSecondsToWaitOnShutdown = asyncExecutorSecondsToWaitOnShutdown;
+        return this;
+    }
+
+    public int getAsyncExecutorMaxTimerJobsPerAcquisition() {
+        return asyncExecutorMaxTimerJobsPerAcquisition;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorMaxTimerJobsPerAcquisition(int asyncExecutorMaxTimerJobsPerAcquisition) {
+        this.asyncExecutorMaxTimerJobsPerAcquisition = asyncExecutorMaxTimerJobsPerAcquisition;
+        return this;
+    }
+
+    public int getAsyncExecutorMaxAsyncJobsDuePerAcquisition() {
+        return asyncExecutorMaxAsyncJobsDuePerAcquisition;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorMaxAsyncJobsDuePerAcquisition(int asyncExecutorMaxAsyncJobsDuePerAcquisition) {
+        this.asyncExecutorMaxAsyncJobsDuePerAcquisition = asyncExecutorMaxAsyncJobsDuePerAcquisition;
+        return this;
+    }
+
+    public int getAsyncExecutorDefaultTimerJobAcquireWaitTime() {
+        return asyncExecutorDefaultTimerJobAcquireWaitTime;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorDefaultTimerJobAcquireWaitTime(int asyncExecutorDefaultTimerJobAcquireWaitTime) {
+        this.asyncExecutorDefaultTimerJobAcquireWaitTime = asyncExecutorDefaultTimerJobAcquireWaitTime;
+        return this;
+    }
+
+    public int getAsyncExecutorDefaultAsyncJobAcquireWaitTime() {
+        return asyncExecutorDefaultAsyncJobAcquireWaitTime;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorDefaultAsyncJobAcquireWaitTime(int asyncExecutorDefaultAsyncJobAcquireWaitTime) {
+        this.asyncExecutorDefaultAsyncJobAcquireWaitTime = asyncExecutorDefaultAsyncJobAcquireWaitTime;
+        return this;
+    }
+
+    public int getAsyncExecutorDefaultQueueSizeFullWaitTime() {
+        return asyncExecutorDefaultQueueSizeFullWaitTime;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorDefaultQueueSizeFullWaitTime(int asyncExecutorDefaultQueueSizeFullWaitTime) {
+        this.asyncExecutorDefaultQueueSizeFullWaitTime = asyncExecutorDefaultQueueSizeFullWaitTime;
+        return this;
+    }
+
+    public String getAsyncExecutorLockOwner() {
+        return asyncExecutorLockOwner;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorLockOwner(String asyncExecutorLockOwner) {
+        this.asyncExecutorLockOwner = asyncExecutorLockOwner;
+        return this;
+    }
+
+    public int getAsyncExecutorTimerLockTimeInMillis() {
+        return asyncExecutorTimerLockTimeInMillis;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorTimerLockTimeInMillis(int asyncExecutorTimerLockTimeInMillis) {
+        this.asyncExecutorTimerLockTimeInMillis = asyncExecutorTimerLockTimeInMillis;
+        return this;
+    }
+
+    public int getAsyncExecutorAsyncJobLockTimeInMillis() {
+        return asyncExecutorAsyncJobLockTimeInMillis;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorAsyncJobLockTimeInMillis(int asyncExecutorAsyncJobLockTimeInMillis) {
+        this.asyncExecutorAsyncJobLockTimeInMillis = asyncExecutorAsyncJobLockTimeInMillis;
+        return this;
+    }
+
+    public int getAsyncExecutorResetExpiredJobsInterval() {
+        return asyncExecutorResetExpiredJobsInterval;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorResetExpiredJobsInterval(int asyncExecutorResetExpiredJobsInterval) {
+        this.asyncExecutorResetExpiredJobsInterval = asyncExecutorResetExpiredJobsInterval;
+        return this;
+    }
+
+    public int getAsyncExecutorResetExpiredJobsMaxTimeout() {
+        return asyncExecutorResetExpiredJobsMaxTimeout;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorResetExpiredJobsMaxTimeout(int asyncExecutorResetExpiredJobsMaxTimeout) {
+        this.asyncExecutorResetExpiredJobsMaxTimeout = asyncExecutorResetExpiredJobsMaxTimeout;
+        return this;
+    }
+
+    public int getAsyncExecutorResetExpiredJobsPageSize() {
+        return asyncExecutorResetExpiredJobsPageSize;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorResetExpiredJobsPageSize(int asyncExecutorResetExpiredJobsPageSize) {
+        this.asyncExecutorResetExpiredJobsPageSize = asyncExecutorResetExpiredJobsPageSize;
+        return this;
+    }
+
+    public ExecuteAsyncRunnableFactory getAsyncExecutorExecuteAsyncRunnableFactory() {
+        return asyncExecutorExecuteAsyncRunnableFactory;
+    }
+
+    public CmmnEngineConfiguration setAsyncExecutorExecuteAsyncRunnableFactory(
+            ExecuteAsyncRunnableFactory asyncExecutorExecuteAsyncRunnableFactory) {
+        this.asyncExecutorExecuteAsyncRunnableFactory = asyncExecutorExecuteAsyncRunnableFactory;
+        return this;
+    }
+    
+    public HttpClientConfig getHttpClientConfig() {
+        return httpClientConfig;
+    }
+
+    public void setHttpClientConfig(HttpClientConfig httpClientConfig) {
+        this.httpClientConfig.merge(httpClientConfig);
     }
 
 }

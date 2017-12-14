@@ -37,6 +37,8 @@ public class PlanItemInstanceEntityImpl extends VariableScopeImpl implements Pla
     protected String stageInstanceId;
     protected boolean isStage;
     protected String elementId;
+    protected String planItemDefinitionId;
+    protected String planItemDefinitionType;
     protected String name;
     protected String state;
     protected Date startTime;
@@ -47,7 +49,7 @@ public class PlanItemInstanceEntityImpl extends VariableScopeImpl implements Pla
     
     // Non-persisted
     protected PlanItem planItem;
-    protected List<PlanItemInstanceEntity> children;
+    protected List<PlanItemInstanceEntity> childPlanItemInstances;
     protected PlanItemInstanceEntity stagePlanItemInstance;
     protected List<SentryPartInstanceEntity> satisfiedSentryPartInstances;
     
@@ -58,6 +60,8 @@ public class PlanItemInstanceEntityImpl extends VariableScopeImpl implements Pla
         persistentState.put("stageInstanceId", stageInstanceId);
         persistentState.put("isStage", isStage);
         persistentState.put("elementId", elementId);
+        persistentState.put("planItemDefinitionId", planItemDefinitionId);
+        persistentState.put("planItemDefinitionType", planItemDefinitionType);
         persistentState.put("name", name);
         persistentState.put("state", state);
         persistentState.put("startTime", startTime);
@@ -72,7 +76,7 @@ public class PlanItemInstanceEntityImpl extends VariableScopeImpl implements Pla
     public PlanItem getPlanItem() {
         if (planItem == null) {
             Case caze = CaseDefinitionUtil.getCase(caseDefinitionId);
-            return (PlanItem) caze.getAllCaseElements().get(elementId);
+            planItem = (PlanItem) caze.getAllCaseElements().get(elementId);
         }
         return planItem;
     }
@@ -106,6 +110,18 @@ public class PlanItemInstanceEntityImpl extends VariableScopeImpl implements Pla
     }
     public void setElementId(String elementId) {
         this.elementId = elementId;
+    }
+    public String getPlanItemDefinitionId() {
+        return planItemDefinitionId;
+    }
+    public void setPlanItemDefinitionId(String planItemDefinitionId) {
+        this.planItemDefinitionId = planItemDefinitionId;
+    }
+    public String getPlanItemDefinitionType() {
+        return planItemDefinitionType;
+    }
+    public void setPlanItemDefinitionType(String planItemDefinitionType) {
+        this.planItemDefinitionType = planItemDefinitionType;
     }
     public String getName() {
         return name;
@@ -151,15 +167,24 @@ public class PlanItemInstanceEntityImpl extends VariableScopeImpl implements Pla
     }
     
     @Override
-    public void setChildren(List<PlanItemInstanceEntity> children) {
-        this.children = children;
+    public void setChildPlanItemInstances(List<PlanItemInstanceEntity> childPlanItemInstances) {
+        this.childPlanItemInstances = childPlanItemInstances;
     }
     
-    public List<PlanItemInstanceEntity> getChildren() {
-        if (children == null) {
-            children = CommandContextUtil.getPlanItemInstanceEntityManager().findChildPlanItemInstancesForStage(id);
+    @Override
+    public List<PlanItemInstanceEntity> getChildPlanItemInstances() {
+        if (childPlanItemInstances == null) {
+            childPlanItemInstances = CommandContextUtil.getPlanItemInstanceEntityManager().findChildPlanItemInstancesForStage(id);
         }
-        return children;
+        return childPlanItemInstances;
+    }
+    
+    @Override
+    public PlanItemInstanceEntity getStagePlanItemInstanceEntity() {
+        if (stagePlanItemInstance == null) {
+            stagePlanItemInstance = CommandContextUtil.getPlanItemInstanceEntityManager().findById(stageInstanceId);
+        }
+        return stagePlanItemInstance;
     }
     
     @Override

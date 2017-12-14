@@ -47,6 +47,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import math.geom2d.Point2D;
+import math.geom2d.conic.Circle2D;
 import math.geom2d.curve.AbstractContinuousCurve2D;
 import math.geom2d.line.Line2D;
 import math.geom2d.polygon.Polyline2D;
@@ -73,14 +74,15 @@ public class CmmnJsonConverter implements EditorJsonConstants, CmmnStencilConsta
         AssociationJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
 
         // task types
-        TaskJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
         HumanTaskJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
         ServiceTaskJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
         DecisionTaskJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
+        HttpTaskJsonConverter.fillTypes(convertersToCmmnMap);
         CaseTaskJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
         ProcessTaskJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
         TimerEventListenerJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
-        
+        TaskJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
+
         // milestone
         MilestoneJsonConverter.fillTypes(convertersToCmmnMap, convertersToJsonMap);
 
@@ -92,9 +94,12 @@ public class CmmnJsonConverter implements EditorJsonConstants, CmmnStencilConsta
     }
 
     private static final List<String> DI_RECTANGLES = new ArrayList<>();
+    private static final List<String> DI_CIRCLES = new ArrayList<>();
     private static final List<String> DI_SENTRY = new ArrayList<>();
 
     static {
+        DI_CIRCLES.add(STENCIL_TIMER_EVENT_LISTENER);
+        
         DI_RECTANGLES.add(STENCIL_TASK);
         DI_RECTANGLES.add(STENCIL_TASK_HUMAN);
         DI_RECTANGLES.add(STENCIL_TASK_SERVICE);
@@ -177,29 +182,29 @@ public class CmmnJsonConverter implements EditorJsonConstants, CmmnStencilConsta
                         planModelGraphicInfo.getY() + planModelGraphicInfo.getHeight(), planModelGraphicInfo.getX(), planModelGraphicInfo.getY());
         planModelNode.putArray(EDITOR_OUTGOING);
         shapesArrayNode.add(planModelNode);
-        
+
         ArrayNode outgoingArrayNode = objectMapper.createArrayNode();
         for (Criterion criterion : planModelStage.getExitCriteria()) {
             GraphicInfo criterionGraphicInfo = model.getGraphicInfo(criterion.getId());
-            ObjectNode criterionNode = CmmnJsonConverterUtil.createChildShape(criterion.getId(), STENCIL_EXIT_CRITERION, 
-                    criterionGraphicInfo.getX() + criterionGraphicInfo.getWidth(), criterionGraphicInfo.getY() + criterionGraphicInfo.getHeight(), 
+            ObjectNode criterionNode = CmmnJsonConverterUtil.createChildShape(criterion.getId(), STENCIL_EXIT_CRITERION,
+                    criterionGraphicInfo.getX() + criterionGraphicInfo.getWidth(), criterionGraphicInfo.getY() + criterionGraphicInfo.getHeight(),
                     criterionGraphicInfo.getX(), criterionGraphicInfo.getY());
-            
+
             shapesArrayNode.add(criterionNode);
             ObjectNode criterionPropertiesNode = objectMapper.createObjectNode();
             criterionPropertiesNode.put(PROPERTY_OVERRIDE_ID, criterion.getId());
             new CriterionJsonConverter().convertElementToJson(criterionNode, criterionPropertiesNode, this, criterion, model);
             criterionNode.set(EDITOR_SHAPE_PROPERTIES, criterionPropertiesNode);
-            
+
             if (CollectionUtils.isNotEmpty(criterion.getOutgoingAssociations())) {
                 ArrayNode criterionOutgoingArrayNode = objectMapper.createArrayNode();
                 for (Association association : criterion.getOutgoingAssociations()) {
                     criterionOutgoingArrayNode.add(CmmnJsonConverterUtil.createResourceNode(association.getId()));
                 }
-                
+
                 criterionNode.set("outgoing", criterionOutgoingArrayNode);
             }
-            
+
             outgoingArrayNode.add(CmmnJsonConverterUtil.createResourceNode(criterion.getId()));
         }
         planModelNode.set("outgoing", outgoingArrayNode);
@@ -429,23 +434,23 @@ public class CmmnJsonConverter implements EditorJsonConstants, CmmnStencilConsta
             if (planItemDefinition instanceof Stage) {
                 Stage stage = (Stage) planItemDefinition;
                 postProcessElements(stage, stage.getPlanItems(), edgeMap, associationMap, cmmnModel, cmmnModelIdHelper);
-                
+
             } else if (planItemDefinition instanceof TimerEventListener) {
                 TimerEventListener timerEventListener = (TimerEventListener) planItemDefinition;
-                
+
                 // The modeler json has referenced the plan item definition. Swapping it with the plan item id when found.
                 String startTriggerSourceRef = timerEventListener.getTimerStartTriggerSourceRef();
                 if (StringUtils.isNotEmpty(startTriggerSourceRef)) {
                     PlanItemDefinition referencedPlanItemDefinition = parentStage.findPlanItemDefinition(startTriggerSourceRef);
                     timerEventListener.setTimerStartTriggerSourceRef(referencedPlanItemDefinition.getPlanItemRef());
                 }
-                
+
             }
 
              if (CollectionUtils.isNotEmpty(planItem.getCriteriaRefs())) {
                  createSentryParts(planItem.getCriteriaRefs(), parentStage, associationMap, cmmnModel, cmmnModelIdHelper, planItem, planItem);
             }
-             
+
         }
     }
 
@@ -674,7 +679,10 @@ public class CmmnJsonConverter implements EditorJsonConstants, CmmnStencilConsta
             List<GraphicInfo> graphicInfoList = new ArrayList<>();
 
             AbstractContinuousCurve2D source2D = null;
-            if (DI_RECTANGLES.contains(sourceRefStencilId)) {
+            if (DI_CIRCLES.contains(sourceRefStencilId)) {
+                source2D = new Circle2D(sourceInfo.getX() + sourceDockersX, sourceInfo.getY() + sourceDockersY, sourceDockersX);
+                
+            } else if (DI_RECTANGLES.contains(sourceRefStencilId)) {
                 source2D = createRectangle(sourceInfo);
 
             } else if (DI_SENTRY.contains(sourceRefStencilId)) {
@@ -716,7 +724,13 @@ public class CmmnJsonConverter implements EditorJsonConstants, CmmnStencilConsta
             }
 
             AbstractContinuousCurve2D target2D = null;
-            if (DI_RECTANGLES.contains(targetRefStencilId)) {
+            if (DI_CIRCLES.contains(targetRefStencilId)) {
+                double targetDockersX = dockersNode.get(dockersNode.size() - 1).get(EDITOR_BOUNDS_X).asDouble();
+                double targetDockersY = dockersNode.get(dockersNode.size() - 1).get(EDITOR_BOUNDS_Y).asDouble();
+
+                target2D = new Circle2D(targetInfo.getX() + targetDockersX, targetInfo.getY() + targetDockersY, targetDockersX);
+                
+            } if (DI_RECTANGLES.contains(targetRefStencilId)) {
                 target2D = createRectangle(targetInfo);
 
             } else if (DI_SENTRY.contains(targetRefStencilId)) {
